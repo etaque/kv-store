@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,9 @@ pub enum Command {
     Del {
         key: String,
     },
+    Ping,
+    Command,
+    CommandDocs,
 }
 
 struct Store {
@@ -64,6 +67,8 @@ pub enum KvError {
     Parse(String),
     #[error("WAL parse error: {0}")]
     WalParse(String),
+    #[error("End of file")]
+    Eof,
 }
 
 pub fn run_server(listener: TcpListener) -> Result<(), KvError> {
@@ -91,107 +96,107 @@ pub fn run_server(listener: TcpListener) -> Result<(), KvError> {
     Ok(())
 }
 
-fn parse_wal_command(line: &str) -> Result<Command, KvError> {
-    let mut parts = line.split_whitespace();
-    match parts.next() {
-        Some("SET") => match (parts.next(), parts.next()) {
-            (Some(key), Some(value)) => {
-                let ttl = match parts.next() {
-                    Some(ts) => ts
-                        .parse()
-                        .map(Some)
-                        .map_err(|_| KvError::Parse(format!("invalid TTL: {}", ts)))?,
-                    None => None,
-                };
-                Ok(Command::Set {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                    ttl,
-                })
-            }
-            _ => Err(KvError::WalParse(format!("malformed SET: {}", line))),
-        },
-        Some("DEL") => match parts.next() {
-            Some(key) => Ok(Command::Del {
-                key: key.to_string(),
-            }),
-            None => Err(KvError::WalParse(format!("malformed DEL: {}", line))),
-        },
-        _ => Err(KvError::WalParse(format!("unknown command: {}", line))),
-    }
-}
-
 fn handle_client(
     stream: TcpStream,
     store: Arc<Mutex<Store>>,
     wal_path: &Path,
 ) -> Result<(), KvError> {
     let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
 
-    for line in reader.lines() {
-        let line = line?;
-        let response = match parse_command(&line) {
+    loop {
+        let args = match read_resp_array(&mut reader) {
+            Err(KvError::Eof) => break,
+            other => other?,
+        };
+
+        let response = match parse_args(&args) {
             Ok(Command::Set { key, value, ttl }) => {
                 let expires_at = ttl.map(|ttl| SystemTime::now() + Duration::from_secs(ttl));
                 store.lock().unwrap().set(key, value, expires_at);
-                wal_append(wal_path, &line)?;
-                "OK".to_string()
+                wal_append(wal_path, &args)?;
+                resp_simple("OK")
             }
             Ok(Command::Get { key }) => match store.lock().unwrap().get(&key) {
-                Some(value) => value.to_string(),
-                None => "".to_string(),
+                Some(value) => resp_bulk(&value.to_string()),
+                None => resp_null(),
             },
             Ok(Command::Del { key }) => {
-                store.lock().unwrap().del(&key);
-                wal_append(wal_path, &line)?;
-                "OK".to_string()
+                wal_append(wal_path, &args)?;
+                if store.lock().unwrap().del(&key) {
+                    resp_integer(1)
+                } else {
+                    resp_integer(0)
+                }
             }
-            Err(KvError::Parse(msg)) => format!("ERR {}", msg),
-            Err(_) => "ERR".to_string(),
+            Ok(Command::Ping) => resp_simple("PONG"),
+            Ok(Command::Command) => resp_bulk(""),
+            Ok(Command::CommandDocs) => resp_array(&[]),
+            Err(KvError::Parse(msg)) => resp_error(&msg),
+            Err(e) => resp_error(&e.to_string()),
         };
-        writeln!(writer, "{}", response)?;
+
+        writer.write_all(response.as_bytes())?;
         writer.flush()?;
     }
     Ok(())
 }
 
-fn parse_command(input: &str) -> Result<Command, KvError> {
-    let mut parts = input.split_whitespace();
-    match parts.next() {
-        Some("GET") => match parts.next() {
-            Some(key) => Ok(Command::Get {
+fn read_resp_array<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<String>, KvError> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(KvError::Eof);
+    };
+
+    let line = line.trim_end();
+    let count: usize = line
+        .strip_prefix('*')
+        .ok_or_else(|| KvError::Parse("expected array".into()))?
+        .parse()
+        .map_err(|_| KvError::Parse("invalid array length".into()))?;
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        let len: usize = header
+            .trim_end()
+            .strip_prefix('$')
+            .ok_or_else(|| KvError::Parse("expected bulk string".into()))?
+            .parse()
+            .map_err(|_| KvError::Parse("invalid bulk length".into()))?;
+        let mut buf = vec![0u8; len + 2];
+        reader.read_exact(&mut buf)?;
+        buf.truncate(len);
+        args.push(String::from_utf8_lossy(&buf).into_owned());
+    }
+    Ok(args)
+}
+
+fn parse_args(args: &[String]) -> Result<Command, KvError> {
+    match args.iter().as_slice() {
+        [cmd, key] if cmd == "GET" => Ok(Command::Get {
+            key: key.to_string(),
+        }),
+        [cmd, key, value, rest @ ..] if cmd == "SET" => {
+            let ttl: Option<u64> = match rest.iter().as_slice() {
+                [ex, secs] if ex == "EX" => secs
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| KvError::Parse(format!("invalid TTL: {}", secs)))?,
+                _ => None,
+            };
+
+            Ok(Command::Set {
                 key: key.to_string(),
-            }),
-            None => Err(KvError::Parse("invalid GET command: GET key".to_string())),
-        },
-        Some("SET") => match (parts.next(), parts.next()) {
-            (Some(key), Some(value)) => {
-                let ttl: Option<u64> = match (parts.next(), parts.next()) {
-                    (Some("EX"), None) => Err(KvError::Parse("missing TTL value".to_string()))?,
-                    (Some("EX"), Some(secs)) => secs
-                        .parse()
-                        .map(Some)
-                        .map_err(|_| KvError::Parse(format!("invalid TTL: {}", secs)))?,
-                    (None, None) => None,
-                    _ => Err(KvError::Parse("unexpected argument".to_string()))?,
-                };
-                Ok(Command::Set {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                    ttl,
-                })
-            }
-            _ => Err(KvError::Parse(
-                "invalid SET command: SET key value [EX ttl]".to_string(),
-            )),
-        },
-        Some("DEL") => match parts.next() {
-            Some(key) => Ok(Command::Del {
-                key: key.to_string(),
-            }),
-            _ => Err(KvError::Parse("invalid DEL command: DEL key".to_string())),
-        },
+                value: value.to_string(),
+                ttl,
+            })
+        }
+        [cmd, key] if cmd == "DEL" => Ok(Command::Del {
+            key: key.to_string(),
+        }),
+        [cmd] if cmd == "PING" => Ok(Command::Ping),
+        [cmd, ..] if cmd == "COMMAND" => Ok(Command::Command),
         _ => Err(KvError::Parse("unknown command".to_string())),
     }
 }
@@ -200,10 +205,15 @@ fn wal_replay(path: &Path, store: &mut Store) -> Result<(), KvError> {
     if !path.exists() {
         return Ok(());
     }
-    let reader = BufReader::new(File::open(path)?);
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        match parse_wal_command(&line) {
+
+    let mut reader = BufReader::new(File::open(path)?);
+
+    loop {
+        let args = match read_resp_array(&mut reader) {
+            Err(KvError::Eof) => break,
+            other => other?,
+        };
+        match parse_args(&args) {
             Ok(Command::Set { key, value, ttl }) => {
                 let expires_at = ttl.map(|ts| UNIX_EPOCH + Duration::from_secs(ts));
                 store.set(key, value, expires_at);
@@ -212,19 +222,48 @@ fn wal_replay(path: &Path, store: &mut Store) -> Result<(), KvError> {
                 store.del(&key);
             }
             Ok(_) => {
-                eprintln!("WAL line {}: unexpected command, skipping", i + 1);
+                eprintln!("WAL error: unexpected command, skipping");
             }
             Err(e) => {
-                eprintln!("WAL line {}: {}", i + 1, e);
+                eprintln!("WAL error: {}", e);
             }
         }
     }
+
     Ok(())
 }
 
-fn wal_append(path: &Path, line: &str) -> Result<(), KvError> {
+fn resp_simple(s: &str) -> String {
+    format!("+{}\r\n", s)
+}
+
+fn resp_error(s: &str) -> String {
+    format!("-ERR {}\r\n", s)
+}
+
+fn resp_integer(n: i64) -> String {
+    format!(":{}\r\n", n)
+}
+
+fn resp_bulk(s: &str) -> String {
+    format!("${}\r\n{}\r\n", s.len(), s)
+}
+
+fn resp_array(arr: &[String]) -> String {
+    let mut res = format!("*{}\r\n", arr.len());
+    for s in arr {
+        res += &resp_bulk(s);
+    }
+    res
+}
+
+fn resp_null() -> String {
+    "$-1\r\n".into()
+}
+
+fn wal_append(path: &Path, args: &[String]) -> Result<(), KvError> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{}", line)?;
+    write!(file, "{}", resp_array(args))?;
     Ok(())
 }
 
@@ -232,12 +271,16 @@ fn wal_append(path: &Path, line: &str) -> Result<(), KvError> {
 mod tests {
     use super::*;
 
-    // --- parse_command ---
+    // --- parse_args ---
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn parse_get() {
         assert_eq!(
-            parse_command("GET foo").unwrap(),
+            parse_args(&args(&["GET", "foo"])).unwrap(),
             Command::Get {
                 key: "foo".to_string()
             }
@@ -247,7 +290,7 @@ mod tests {
     #[test]
     fn parse_set() {
         assert_eq!(
-            parse_command("SET foo bar").unwrap(),
+            parse_args(&args(&["SET", "foo", "bar"])).unwrap(),
             Command::Set {
                 key: "foo".to_string(),
                 value: "bar".to_string(),
@@ -259,7 +302,7 @@ mod tests {
     #[test]
     fn parse_set_with_ttl() {
         assert_eq!(
-            parse_command("SET foo bar EX 30").unwrap(),
+            parse_args(&args(&["SET", "foo", "bar", "EX", "30"])).unwrap(),
             Command::Set {
                 key: "foo".to_string(),
                 value: "bar".to_string(),
@@ -270,18 +313,13 @@ mod tests {
 
     #[test]
     fn parse_set_with_invalid_ttl() {
-        assert!(parse_command("SET foo bar EX notnum").is_err());
-    }
-
-    #[test]
-    fn parse_set_with_missing_ttl() {
-        assert!(parse_command("SET foo bar EX").is_err());
+        assert!(parse_args(&args(&["SET", "foo", "bar", "EX", "notnum"])).is_err());
     }
 
     #[test]
     fn parse_del() {
         assert_eq!(
-            parse_command("DEL foo").unwrap(),
+            parse_args(&args(&["DEL", "foo"])).unwrap(),
             Command::Del {
                 key: "foo".to_string()
             }
@@ -289,17 +327,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_ping() {
+        assert_eq!(parse_args(&args(&["PING"])).unwrap(), Command::Ping);
+    }
+
+    #[test]
     fn parse_missing_args() {
-        assert!(parse_command("GET").is_err());
-        assert!(parse_command("SET").is_err());
-        assert!(parse_command("SET foo").is_err());
-        assert!(parse_command("DEL").is_err());
+        assert!(parse_args(&args(&["GET"])).is_err());
+        assert!(parse_args(&args(&["SET"])).is_err());
+        assert!(parse_args(&args(&["SET", "foo"])).is_err());
+        assert!(parse_args(&args(&["DEL"])).is_err());
     }
 
     #[test]
     fn parse_unknown_command() {
-        assert!(parse_command("PING").is_err());
-        assert!(parse_command("").is_err());
+        assert!(parse_args(&args(&["NOPE"])).is_err());
+        assert!(parse_args(&args(&[])).is_err());
     }
 
     // --- Store ---
@@ -363,13 +406,20 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_wal_replay.log");
 
-        let far_future = SystemTime::now()
+        let far_future = (SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + 3600;
+            + 3600)
+            .to_string();
 
-        let wal = format!("SET k1 v1\nSET k2 v2 0\nSET k3 v3 {far_future}\nDEL k1\n");
+        let wal = [
+            resp_array(&args(&["SET", "k1", "v1"])),
+            resp_array(&args(&["SET", "k2", "v2", "EX", "0"])),
+            resp_array(&args(&["SET", "k3", "v3", "EX", &far_future])),
+            resp_array(&args(&["DEL", "k1"])),
+        ]
+        .join("");
         std::fs::write(&path, wal).unwrap();
 
         let mut store = Store::new();

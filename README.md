@@ -4,7 +4,8 @@ In-memory key-value store accessible over TCP. Nothing production-grade, this is
 
 ## Features
 
-- Text protocol with `GET`, `SET`, and `DEL` commands
+- RESP (REdis Serialization Protocol) compatible — works with `redis-cli` and any Redis client library
+- `GET`, `SET`, `DEL`, and `PING` commands
 - TTL support via `SET key value EX seconds`
 - Multi-client support (threaded, `Arc<Mutex>`)
 - Write-ahead log (WAL) for persistence across restarts
@@ -17,42 +18,55 @@ cargo build --release
 cargo run
 ```
 
-Connect with `nc`:
+Connect with `redis-cli`:
 
 ```bash
-nc localhost 7878
+redis-cli -p 7878
 ```
 
 ## Protocol
 
+Commands are sent as RESP arrays of bulk strings. Responses use standard RESP types.
+
 ### SET
 
 ```
-SET key value
-OK
+> SET key value
++OK
 
-SET key value EX 60
-OK
+> SET key value EX 60
++OK
 ```
 
 ### GET
 
 ```
-GET key
+> GET key
+$5
 value
 
-GET missing
-(empty line)
+> GET missing
+$-1
 ```
 
 ### DEL
 
 ```
-DEL key
-OK
+> DEL key
+:1
+
+> DEL missing
+:0
 ```
 
-Unrecognized or malformed commands return `ERR <message>`.
+### PING
+
+```
+> PING
++PONG
+```
+
+Unrecognized or malformed commands return `-ERR <message>`.
 
 ## Testing
 
